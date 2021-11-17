@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # Pintos
 
 Pintos, a simple operating system framework for the 80x86 architecture created at Stanford University
@@ -33,3 +34,7 @@ $ git clone git://pintos-os.org/pintos-anon pintos
 ## Run Pintos in QEMU
 
 Refer to [here](https://github.com/ivogeorg/os-playground/blob/master/pintos-with-qemu.md).
+=======
+# Pintos-Project2
+Pintos Project 2
+>>>>>>> 024dfce2861100170bfd28a4c83cf94a555f2432
