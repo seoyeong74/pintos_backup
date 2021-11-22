@@ -5,6 +5,8 @@
 #include <list.h>
 #include <stdint.h>
 #include "threads/synch.h"
+#include "lib/kernel/hash.h"
+#include "vm/page.h"
 
 /* States in a thread's life cycle. */
 enum thread_status
@@ -113,6 +115,10 @@ struct thread
 
     /* Owned by thread.c. */
     unsigned magic;                     /* Detects stack overflow. */
+    struct hash vm;
+	/* mmap_file list */
+	struct list mmap_list;
+	int mapid;
   };
 
 /* If false (default), use round-robin scheduler.

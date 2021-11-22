@@ -18,6 +18,7 @@
 #include "threads/palloc.h"
 #include "threads/thread.h"
 #include "threads/vaddr.h"
+
 // #include "vm/page.h"
 
 static thread_func start_process NO_RETURN;
@@ -27,7 +28,7 @@ static bool load (const char *cmdline, void (**eip) (void), void **esp);
    FILENAME.  The new thread may be scheduled (and may even exit)
    before process_execute() returns.  Returns the new process's
    thread id, or TID_ERROR if the thread cannot be created. */
-tid_t
+int
 process_execute (const char *file_name)
 {
   char *fn_copy;
@@ -46,8 +47,10 @@ process_execute (const char *file_name)
   strlcpy(copy_file_name, file_name, strlen(file_name) + 1);
   char* first_token = strtok_r(copy_file_name, " ", &next_pointer);
 
+  lock_acquire(&file_lock); //찢었다. 
   if(filesys_open(first_token) == NULL)
     return -1;
+  lock_release(&file_lock);
 
   // printf("origin :%d\n", strlen(fn_copy));
   // printf("token :%d\n", strlen(first_token));
@@ -55,7 +58,10 @@ process_execute (const char *file_name)
 
   /* Create a new thread to execute FILE_NAME. */
   tid = thread_create (first_token, PRI_DEFAULT, start_process, fn_copy);
-
+  
+  if (tid == TID_ERROR)
+    palloc_free_page (fn_copy);
+  
   sema_down(&thread_current()->sema_load);
   struct list_elem* e;
   struct thread* cur = thread_current();
@@ -64,10 +70,8 @@ process_execute (const char *file_name)
     struct thread* check_thread = list_entry(e, struct thread, child_elem);
     if(check_thread->load_success == 0)
       return process_wait(tid);
-     
   }
-  if (tid == TID_ERROR)
-    palloc_free_page (fn_copy);
+  
   return tid;
 }
 
@@ -116,6 +120,101 @@ stack_construction(char** argv, int argc, void** esp)
 
 }
 
+bool handle_mm_fault(struct vm_entry *vme)
+{
+	/* get a physical memory */
+	struct page *new_page = alloc_page(PAL_USER);
+	new_page->vme = vme;
+	vme->pinned = true;
+	if(vme->is_loaded == true){       // if vme is already loaded, return false
+		free_page(new_page);
+		return false;
+	}
+	if(new_page == NULL)
+		return false;
+	switch(vme->type)                
+	{
+		/* if vm_entry type is VM_BIN */
+		case VM_BIN:
+			/* try to load_file to physical memory if fail, free the physical memory */
+			if(load_file(new_page->kaddr,vme) == false)
+			{
+				free_page(new_page->kaddr);
+				return false;
+			}
+			break;
+		/* if vm_entry type is VM_FILE */
+		case VM_FILE:
+			if(load_file(new_page->kaddr,vme) == false)
+			{
+				free_page(new_page->kaddr);
+				return false;
+			}
+			break;
+		case VM_ANON:
+			swap_in(vme->swap_slot, new_page->kaddr);
+			break;
+		default:
+			return false;
+	}
+	/* set a page table. if fail, free the physical memory  */
+	if(install_page(vme->vaddr,new_page->kaddr, vme->writable) == false)
+	{
+		free_page(new_page->kaddr);
+		return false;
+	}
+	/* set vme->is_loaded is true */
+	vme->is_loaded = true;
+	return true;
+}
+
+bool expand_stack(void *addr)
+{
+	struct vm_entry *vme;
+	struct page *stack_page;
+
+	/* check stack is fulled */
+	if((size_t)(PHYS_BASE - pg_round_down(addr)) > MAX_STACK_SIZE)
+		return false;
+
+	/* allocate vm_entry and initialize the vm_entry */
+	vme = malloc(sizeof(struct vm_entry));
+	if(vme == NULL)
+		return false;
+	vme->vaddr     = pg_round_down(addr);
+	vme->type      = VM_ANON;
+	vme->is_loaded = true;
+	vme->writable  = true;
+	vme->pinned    = true;
+	/* allocate page and initialize the page's vm_entry */
+	stack_page = alloc_page(PAL_USER);
+	if(stack_page == NULL)
+	{
+		free(vme);
+		return false;
+	}
+	stack_page->vme = vme;
+	/* setting the page table. */
+	if(install_page(vme->vaddr, stack_page->kaddr, vme->writable) == false)
+	{
+		free_page(stack_page);
+		free(vme);
+		return false;
+	}
+	/* insert vm_entry to hash_table */
+	if(insert_vme(&thread_current()->vm, vme) == false)
+	{
+		free_page(stack_page);
+		free(vme);
+		return false;
+	}
+	if(intr_context())
+	{
+		vme->pinned = false;
+	}
+	return true;
+}
+
 /* A thread function that loads a user process and starts it
    running. */
 static void
@@ -131,6 +230,8 @@ start_process (void *file_name_)
   if_.gs = if_.fs = if_.es = if_.ds = if_.ss = SEL_UDSEG;
   if_.cs = SEL_UCSEG;
   if_.eflags = FLAG_IF | FLAG_MBS;
+
+  vm_init(&(thread_current()->vm));
 
   char copy_file_name[128];
   strlcpy(copy_file_name, file_name, strlen(file_name) + 1);
@@ -227,10 +328,16 @@ process_exit (void)
   uint32_t *pd;
   int i = 0;
 
-  for(i = 0; i < 128; i++)
+  for(i = 2; i < 130; i++)
   {
     close_file(i);
   }
+
+  // palloc_free_page(cur->file_descriptor);
+  /* unmap the all process's mapped file and 
+     destroy vm_entry hash */
+  munmap(CLOSE_ALL);
+  vm_destroy(&cur->vm);
 
   // free(cur->file_descriptor);
 
@@ -528,6 +635,10 @@ static bool
 load_segment (struct file *file, off_t ofs, uint8_t *upage,
               uint32_t read_bytes, uint32_t zero_bytes, bool writable)
 {
+  struct vm_entry *vme;
+  /* reopen the file for insert re open file to vm_entry */
+  struct file *reopen_file = file_reopen(file);
+
   ASSERT ((read_bytes + zero_bytes) % PGSIZE == 0);
   ASSERT (pg_ofs (upage) == 0);
   ASSERT (ofs % PGSIZE == 0);
@@ -538,32 +649,36 @@ load_segment (struct file *file, off_t ofs, uint8_t *upage,
       /* Calculate how to fill this page.
          We will read PAGE_READ_BYTES bytes from FILE
          and zero the final PAGE_ZERO_BYTES bytes. */
+      vme = malloc(sizeof(struct vm_entry));
+      if(vme == NULL)
+        return false;
+      /* Calculate how to fill this page.
+         We will read PAGE_READ_BYTES bytes from FILE
+         and zero the final PAGE_ZERO_BYTES bytes. */
       size_t page_read_bytes = read_bytes < PGSIZE ? read_bytes : PGSIZE;
       size_t page_zero_bytes = PGSIZE - page_read_bytes;
 
-      /* Get a page of memory. */
-      uint8_t *kpage = palloc_get_page (PAL_USER);
-      if (kpage == NULL)
-        return false;
+      /* intialize vm_entry */
+      /* insert re open file */
+      vme->file       = reopen_file;
+      vme->offset     = ofs;
+      vme->vaddr      = upage;
+      vme->read_bytes = page_read_bytes;
+      vme->zero_bytes = page_zero_bytes;
+      vme->writable    = writable;
+      vme->is_loaded  = false;
+      vme->type       = VM_BIN;
+      vme->pinned     = false;
 
-      /* Load this page. */
-      if (file_read (file, kpage, page_read_bytes) != (int) page_read_bytes)
-        {
-          palloc_free_page (kpage);
-          return false;
-        }
-      memset (kpage + page_read_bytes, 0, page_zero_bytes);
-
-      /* Add the page to the process's address space. */
-      if (!install_page (upage, kpage, writable))
-        {
-          palloc_free_page (kpage);
-          return false;
-        }
-
+      /* added vm_entry to hash */
+      if(insert_vme(&thread_current()->vm, vme) == false )
+      {
+        printf("insert_vme error!\n");
+      }
       /* Advance. */
       read_bytes -= page_read_bytes;
       zero_bytes -= page_zero_bytes;
+      ofs += page_read_bytes;
       upage += PGSIZE;
     }
   return true;
@@ -574,18 +689,35 @@ load_segment (struct file *file, off_t ofs, uint8_t *upage,
 static bool
 setup_stack (void **esp)
 {
-  uint8_t *kpage;
+  struct vm_entry *vme;	
+  struct page *kpage;
   bool success = false;
-
-  kpage = palloc_get_page (PAL_USER | PAL_ZERO);
-  if (kpage != NULL)
+  void *virtual_address = ((uint8_t *) PHYS_BASE) - PGSIZE;
+  kpage = alloc_page (PAL_USER | PAL_ZERO);
+  if (kpage != NULL) 
     {
-      success = install_page (((uint8_t *) PHYS_BASE) - PGSIZE, kpage, true);
+      success = install_page ( pg_round_down(virtual_address), kpage->kaddr, true);
       if (success)
         *esp = PHYS_BASE;
       else
-        palloc_free_page (kpage);
+        free_page (kpage->kaddr);
     }
+ 
+  vme = malloc(sizeof(struct vm_entry));
+  if(vme == NULL){
+	  free_page(kpage);
+	  return false;
+  }
+  /* initialize vm_entry */
+  vme->vaddr     = pg_round_down(virtual_address);
+  vme->is_loaded = true;
+  vme->writable  = true;
+  vme->type      = VM_ANON;
+  vme->pinned    = true;
+  kpage->vme     = vme;
+  /* insert vm_entry. if fail, return false*/
+  success = insert_vme(&thread_current()->vm, vme);
+
   return success;
 }
 

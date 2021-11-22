@@ -462,7 +462,7 @@ init_thread (struct thread *t, const char *name, int priority)
   list_init(&(t->child_list));
   list_push_back(&(running_thread()->child_list), &(t->child_elem));
   t->parent_thread = running_thread();
-
+  list_init(&(t->mmap_list));
   int i;
   for(i = 0; i < 130; i++)
   {

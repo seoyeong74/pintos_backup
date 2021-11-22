@@ -22,6 +22,8 @@
 #include "threads/palloc.h"
 #include "threads/pte.h"
 #include "threads/thread.h"
+#include "vm/page.h"
+#include "vm/swap.h"
 #ifdef USERPROG
 #include "userprog/process.h"
 #include "userprog/exception.h"
@@ -128,6 +130,9 @@ main (void)
 #endif
 
   printf ("Boot complete.\n");
+
+  lru_list_init();
+  swap_init();
   
   /* Run actions specified on kernel command line. */
   run_actions (argv);
